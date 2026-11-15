@@ -1,0 +1,157 @@
+name: Build APK
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: '8.9' }
+      - run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - name: code
+        run: |
+          mkdir -p app/src/main/java/ru/glubina/game
+          cat > settings.gradle.kts <<'E1'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = "Glubina"; include(":app")
+          E1
+          cat > build.gradle.kts <<'E2'
+          plugins { id("com.android.application") version "8.7.3" apply false; id("org.jetbrains.kotlin.android") version "2.0.21" apply false }
+          E2
+          cat > app/build.gradle.kts <<'E3'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android { namespace = "ru.glubina.game"; compileSdk = 35
+            defaultConfig { applicationId = "ru.glubina.game"; minSdk = 24; targetSdk = 35; versionCode = 1; versionName = "1.0" }
+            compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+            kotlinOptions { jvmTarget = "17" } }
+          E3
+          cat > app/src/main/AndroidManifest.xml <<'E4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.VIBRATE"/>
+            <application android:allowBackup="true" android:label="Глубина" android:theme="@android:style/Theme.Material.NoActionBar">
+              <activity android:name=".MainActivity" android:exported="true" android:screenOrientation="portrait">
+                <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          E4
+          cat > app/src/main/java/ru/glubina/game/Game.kt <<'E5'
+          package ru.glubina.game
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.content.Context
+          import android.graphics.*
+          import android.graphics.drawable.ColorDrawable
+          import android.media.AudioAttributes
+          import android.media.SoundPool
+          import android.os.*
+          import android.view.*
+          import java.io.BufferedOutputStream
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.util.Locale
+          import java.util.concurrent.ConcurrentHashMap
+          import kotlin.math.*
+          import kotlin.random.Random
+          const val UW = 420f
+          const val TAU = 6.2831855f
+          private fun rnd(a: Float, b: Float) = a + Random.nextFloat() * (b - a)
+          fun mix(a: Int, b: Int, t: Float): Int { val u = 1f - t
+            val A = ((a ushr 24 and 255) * u + (b ushr 24 and 255) * t).toInt()
+            val R = ((a ushr 16 and 255) * u + (b ushr 16 and 255) * t).toInt()
+            val G = ((a ushr 8 and 255) * u + (b ushr 8 and 255) * t).toInt()
+            val B = ((a and 255) * u + (b and 255) * t).toInt()
+            return (A shl 24) or (R shl 16) or (G shl 8) or B }
+          fun shade(c: Int, f: Float): Int { val a = c ushr 24 and 255
+            val r = ((c ushr 16 and 255) * f).toInt().coerceIn(0, 255)
+            val g = ((c ushr 8 and 255) * f).toInt().coerceIn(0, 255)
+            val b = ((c and 255) * f).toInt().coerceIn(0, 255)
+            return (a shl 24) or (r shl 16) or (g shl 8) or b }
+          fun withAlpha(c: Int, a: Int) = (c and 0x00FFFFFF) or (a.coerceIn(0, 255) shl 24)
+          class UpgDef(val n: String, val d: String, val m: Int, val c: IntArray)
+          val UPG = arrayOf(UpgDef("Ядро света","+10 макс. света",5,intArrayOf(3,5,8,12,18)),
+            UpgDef("Магнит","+9 радиус",5,intArrayOf(2,4,7,11,16)),
+            UpgDef("Резонанс","-0.45с откат, +12 радиус",4,intArrayOf(4,7,12,18)),
+            UpgDef("Стойкость","-7% урона",4,intArrayOf(3,6,10,15)))
+          class Store(ctx: Context) { private val p = ctx.getSharedPreferences("g", 0)
+            var bd: Int get() = p.getInt("bd",0); set(v){p.edit().putInt("bd",v).apply()}
+            var bs: Int get() = p.getInt("bs",0); set(v){p.edit().putInt("bs",v).apply()}
+            var pe: Int get() = p.getInt("pe",0); set(v){p.edit().putInt("pe",v).apply()}
+            var mu: Boolean get() = p.getBoolean("mu",false); set(v){p.edit().putBoolean("mu",v).apply()}
+            var hi: Boolean get() = p.getBoolean("hi",false); set(v){p.edit().putBoolean("hi",v).apply()}
+            fun lv(i:Int)=p.getInt("u$i",0); fun sl(i:Int,v:Int){p.edit().putInt("u$i",v).apply()} }
+          object Art { private val sp = HashMap<Int,Bitmap>()
+            private val gp = Paint(Paint.ANTI_ALIAS_FLAG).apply{isFilterBitmap=true}; private val gr = RectF()
+            val bell = LinearGradient(0f,-11f,0f,6f,intArrayOf(0xE6BFF6FF.toInt(),0x9935C8E8.toInt(),0x33158FB0.toInt()),floatArrayOf(0f,.6f,1f),Shader.TileMode.CLAMP)
+            val pred = Path().apply{ moveTo(-23f,0f);quadTo(-10f,-11f,8f,-6f);quadTo(20f,-3f,23f,0f);quadTo(20f,3f,8f,6f);quadTo(-10f,11f,-23f,0f);close();moveTo(-22f,0f);lineTo(-33f,-8f);lineTo(-29f,0f);lineTo(-33f,8f);close() }
+            fun spr(col:Int):Bitmap{ sp[col]?.let{return it}; val s=96; val b=Bitmap.createBitmap(s,s,Bitmap.Config.ARGB_8888); val c=Canvas(b)
+              val core=mix(col,0xFFFFFFFF.toInt(),.75f)
+              val g=RadialGradient(s/2f,s/2f,s/2f,intArrayOf(withAlpha(core,255),withAlpha(col,225),withAlpha(col,90),withAlpha(col,0)),floatArrayOf(0f,.18f,.5f,1f),Shader.TileMode.CLAMP)
+              val p=Paint(Paint.ANTI_ALIAS_FLAG);p.shader=g;c.drawRect(0f,0f,s.toFloat(),s.toFloat(),p);sp[col]=b;return b }
+            fun glow(c:Canvas,x:Float,y:Float,r:Float,col:Int,a:Float){ if(r<=.5f||a<=.01f)return; gp.alpha=(a.coerceIn(0f,1f)*255).toInt(); gr.set(x-r,y-r,x+r,y+r); c.drawBitmap(spr(col),null,gr,gp) }
+            fun glowR(c:Canvas,l:Float,t:Float,r:Float,b:Float,col:Int,a:Float){ if(a<=.01f)return; gp.alpha=(a.coerceIn(0f,1f)*255).toInt(); gr.set(l,t,r,b); c.drawBitmap(spr(col),null,gr,gp) } }
+          class Audio(ctx: Context) { private val cx=ctx.applicationContext; private val sr=22050
+            private val nm=arrayOf("collect","pearl","pulse","hit","shatter","zone","ui","deny","death","warn","dash","amb")
+            private val ids=ConcurrentHashMap<String,Int>(); private val ld=ConcurrentHashMap.newKeySet<Int>()
+            @Volatile private var pool:SoundPool?=null; @Volatile var ready=false; @Volatile var muted=false
+            @Volatile private var hp=false; @Volatile private var st=false; private var amb=0; private val av=.45f
+            private val rt=floatArrayOf(1f,1.125f,1.25f,1.5f,1.6667f,2f)
+            fun init(){ if(st)return; st=true; Thread{ try{ val d=File(cx.cacheDir,"s1");d.mkdirs()
+              for(n in nm){val f=File(d,"$n.wav"); if(!f.exists()||f.length()<100) wav(f,gen(n))}
+              val at=AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_GAME).setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build()
+              val p=SoundPool.Builder().setMaxStreams(10).setAudioAttributes(at).build()
+              p.setOnLoadCompleteListener{_,id,s-> if(s==0){ld.add(id); if(id==ids["amb"])amb(); if(ld.size>=nm.size)ready=true}}
+              for(n in nm)ids[n]=p.load(File(d,"$n.wav").absolutePath,1); pool=p }catch(_:Exception){} }.start() }
+            fun play(n:String,v:Float=1f,r:Float=1f){ if(!ready||muted)return; val id=ids[n]?:return; if(!ld.contains(id))return; pool?.play(id,v,v,1,0,r.coerceIn(.5f,2f)) }
+            fun collect(c:Int)=play("collect",.8f,rt[(c-1).coerceIn(0,5)]); fun pearl()=play("pearl",.9f); fun pulse()=play("pulse",.95f)
+            fun hit()=play("hit",1f); fun shatter()=play("shatter",.7f); fun zone()=play("zone",.75f); fun ui()=play("ui",.5f)
+            fun deny()=play("deny",.6f); fun death()=play("death",.9f); fun warn()=play("warn",.45f); fun dash()=play("dash",.7f)
+            private fun amb(){ val p=pool?:return; val id=ids["amb"]?:return; if(!ld.contains(id)||muted||hp)return; if(amb==0)amb=p.play(id,av,av,0,-1,1f) else p.setVolume(amb,av,av) }
+            fun setMuted(m:Boolean){muted=m; if(m){if(amb!=0)pool?.setVolume(amb,0f,0f)}else amb()}
+            fun duck(on:Boolean){ if(muted||amb==0)return; val v=if(on).12f else av; pool?.setVolume(amb,v,v) }
+            fun hPause(){hp=true;pool?.autoPause()}; fun hResume(){hp=false;pool?.autoResume();amb()}
+            private fun buf(s:Float)=FloatArray((sr*s).toInt())
+            private fun tone(s:Float,f:Float,dec:Float,amp:Float,h2:Float=0f):FloatArray{val o=buf(s);for(i in o.indices){val t=i/sr.toFloat();var v=sin(TAU*f*t)*exp(-t*dec);if(h2>0f)v+=h2*sin(TAU*f*2f*t)*exp(-t*dec*1.7f);o[i]=v*amp};return o}
+            private fun sw(s:Float,f0:Float,f1:Float,dec:Float,na:Float,nd:Float,lp:Float,seed:Int,amp:Float):FloatArray{val o=buf(s);var ph=0f;var l=0f;val r=Random(seed);for(i in o.indices){val t=i/sr.toFloat();ph+=TAU*(f0+(f1-f0)*(t/s))/sr;l+=lp*(r.nextFloat()*2f-1f-l);o[i]=(sin(ph)*exp(-t*dec)+l*na*exp(-t*nd))*amp};return o}
+            private fun add(a:FloatArray,b:FloatArray){for(i in a.indices)if(i<b.size)a[i]+=b[i]}
+            private fun gen(n:String):FloatArray{ when(n){
+              "collect"->return tone(.18f,523.25f,18f,.8f,.35f)
+              "pearl"->{val o=tone(.6f,660f,5f,.48f);add(o,tone(.6f,990f,7f,.32f));add(o,tone(.6f,1320f,10f,.2f));return o}
+              "pulse"->return sw(.5f,130f,40f,5f,1.6f,7f,.12f,11,.85f)
+              "hit"->return sw(.3f,150f,50f,12f,.5f,20f,1f,12,.9f)
+              "shatter"->{val o=buf(.12f);val r=Random(13);var pv=0f;for(i in o.indices){val t=i/sr.toFloat();val w=r.nextFloat()*2f-1f;o[i]=(w-pv)*exp(-t*28f)*.8f;pv=w};return o}
+              "zone"->{val o=buf(1.1f);val fs=floatArrayOf(392f,523.25f,659.25f);for(k in 0..2){val s=(k*.16f*sr).toInt();for(i in s until o.size){val t=(i-s)/sr.toFloat();o[i]+=sin(TAU*fs[k]*t)*exp(-t*7f)*.32f}};return o}
+              "ui"->return tone(.06f,880f,40f,.5f)
+              "deny"->{val o=tone(.15f,160f,18f,.5f);add(o,tone(.15f,120f,18f,.2f));return o}
+              "death"->return sw(1.3f,330f,82f,2.2f,1.2f,3f,.05f,14,.8f)
+              "warn"->return tone(.12f,220f,22f,.5f)
+              "dash"->return sw(.3f,90f,60f,9f,1.4f,6f,.3f,15,.8f)
+              else->{val n6=sr*6;val o=FloatArray(n6);val fs=floatArrayOf(55f,110f,165f,220f);val am=floatArrayOf(.5f,.3f,.18f,.1f);val lk=floatArrayOf(1f,2f,3f,2f);val no=FloatArray(n6);var lp=0f;val r=Random(7);for(i in 0 until n6){lp+=.03f*(r.nextFloat()*2f-1f-lp);no[i]=lp};val fd=(sr*.4f).toInt();for(i in 0 until fd){val w=i/fd.toFloat();no[i]=no[i]*w+no[n6-fd+i]*(1f-w)};var pk=.0001f;for(i in 0 until n6){val t=i/sr.toFloat();var v=0f;for(k in 0..3){val l=.6f+.4f*sin(TAU*(lk[k]/6f)*t+k*1.7f);v+=sin(TAU*fs[k]*t+k*.9f)*am[k]*l};v+=no[i]*1.5f*(.6f+.4f*sin(TAU*(1f/6f)*t));o[i]=v;val a=if(v<0)-v else v;if(a>pk)pk=a};val g=.82f/pk;for(i in 0 until n6)o[i]*=g;return o} } }
+            private fun wav(f:File,s:FloatArray){val o=BufferedOutputStream(FileOutputStream(f));fun w16(v:Int){o.write(v and 255);o.write((v ushr 8) and 255)};fun w32(v:Int){w16(v and 65535);w16((v ushr 16) and 65535)};fun tg(t:String){o.write(t.toByteArray(Charsets.US_ASCII))};val dl=s.size*2;tg("RIFF");w32(36+dl);tg("WAVE");tg("fmt ");w32(16);w16(1);w16(1);w32(sr);w32(sr*2);w16(2);w16(16);tg("data");w32(dl);for(v in s)w16((v.coerceIn(-1f,1f)*32767f).toInt() and 65535);o.flush();o.close()} }
+          class Pal(var top:Int,var bot:Int,var acc:Int,var mote:Int,var rays:Float,var dark:Float,var vent:Float){
+            fun set(o:Pal){top=o.top;bot=o.bot;acc=o.acc;mote=o.mote;rays=o.rays;dark=o.dark;vent=o.vent}
+            fun lerp(a:Pal,b:Pal,t:Float){top=mix(a.top,b.top,t);bot=mix(a.bot,b.bot,t);acc=mix(a.acc,b.acc,t);mote=mix(a.mote,b.mote,t);rays=a.rays+(b.rays-a.rays)*t;dark=a.dark+(b.dark-a.dark)*t;vent=a.vent+(b.vent-a.vent)*t} }
+          class Zone(val n:String,val at:Float,val sp:Float,val k:Int,val sm:Float,val p:Pal)
+          val ZONES=arrayOf(
+            Zone("ОТМЕЛЬ",0f,70f,1,1f,Pal(0xFF0B4F63.toInt(),0xFF06283C.toInt(),0xFF35E0C8.toInt(),0xFF7CF5D8.toInt(),1f,0f,0f)),
+            Zone("СУМЕРКИ",150f,84f,3,1f,Pal(0xFF123A6B.toInt(),0xFF071B38.toInt(),0xFF4FA8FF.toInt(),0xFF8FD0FF.toInt(),.35f,.28f,0f)),
+            Zone("ПОЛНОЧЬ",400f,97f,3,1f,Pal(0xFF1B2360.toInt(),0xFF0A0E2A.toInt(),0xFF8B7CFF.toInt(),0xFFB9A8FF.toInt(),0f,.55f,0f)),
+            Zone("БЕЗДНА",750f,110f,3,1f,Pal(0xFF171040.toInt(),0xFF060418.toInt(),0xFFFF4FD8.toInt(),0xFFFF9BEA.toInt(),0f,.78f,0f)),
+            Zone("РАЗЛОМ",1200f,124f,7,1f,Pal(0xFF241028.toInt(),0xFF090310.toInt(),0xFFFF9A3D.toInt(),0xFFFFC46B.toInt(),0f,.85f,1f)),
+            Zone("СЕРДЦЕ БЕЗДНЫ",1800f,138f,7,.9f,Pal(0xFF0A1420.toInt(),0xFF020507.toInt(),0xFF3DFFB0.toInt(),0xFFA5FFD6.toInt(),0f,.9f,.5f)))
+          class Mote{var x=0f;var y=0f;var vx=0f;var ph=0f;var pearl=false;var mag=false}
+          class Haz{var k=0;var x=0f;var y=0f;var vx=0f;var dir=1f;var ph=0f;var rot=0f;var st=0;var t=0f;var by=0f;var tn=0;val tr=FloatArray(48);val path=Path()}
+          class Ptc{var x=0f;var y=0f;var vx=0f;var vy=0f;var life=0f;var max=1f;var size=4f;var col=0;var k=0}
+          class Ftx{var x=0f;var y=0f;var life=0f;var max=1f;var size=10f;var col=0;var s=""}
+          class Snow{var x=0f;var y=0f;var z=0;var ph=0f}
+          class Wall(val mul:Float,val amp:Float,seed:Int){var pts=FloatArray(0);var off=0f;private var last=10f;private val r=Random(seed)
+            fun rebuild(h:Float){val n=(h/26f).toInt()+4;pts=FloatArray(n);var v=amp*.5f;for(i in 0 until n){v=(v+(r.nextFloat()-.5f)*16f).coerceIn(3f,amp);pts[i]=v};last=v}
+            fun step(d:Float){off+=d*mul;while(off>=26f){off-=26f;if(pts.size>1){System.arraycopy(pts,1,pts,0,pts.size-1);last=(last+(r.nextFloat()-.5f)*16f).coerceIn(3f,amp);pts[pts.size-1]=last}}} }
